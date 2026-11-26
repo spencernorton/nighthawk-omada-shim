@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a change to how Nighthawk Omada Shim works.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that Nighthawk Omada Shim makes hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should change, and what should it look like?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - "ECSP discovery / adoption"
+        - "Netgear SOAP adapter"
+        - "Stock dashboard reader"
+        - "Beacon / uplink observers"
+        - "Client attribution / multi-AP"
+        - "Docker / healthcheck"
+        - "Other / not sure"
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

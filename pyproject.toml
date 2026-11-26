@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-omada-device-agent"
+version = "0.9.1"
+description = "Connect stock-firmware Netgear Nighthawk access points to a TP-Link Omada controller over ECSP"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Spencer Norton" },
+  { name = "Open Omada contributors" },
+]
+keywords = ["netgear", "nighthawk", "rs700", "omada", "ecsp", "networking", "interoperability"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Networking",
+]
+dependencies = [
+  "python-dotenv>=1.0,<2",
+  "psutil>=5.9,<8",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
+  "ruff>=0.6,<1",
+]
+uplink = [
+  "tplink-omada-client>=1.4,<2",
+]
+
+[project.scripts]
+open-omada-agent = "open_omada_device_agent.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/spencernorton/nighthawk-omada-shim"
+Repository = "https://github.com/spencernorton/nighthawk-omada-shim"
+Issues = "https://github.com/spencernorton/nighthawk-omada-shim/issues"
+Changelog = "https://github.com/spencernorton/nighthawk-omada-shim/blob/main/CHANGELOG.md"
+Upstream = "https://github.com/adryanalencar/open-omada-device-agent"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]

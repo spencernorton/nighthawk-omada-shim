@@ -1,0 +1,40 @@
+services:
+  nighthawk-omada-shim:
+    image: ghcr.io/spencernorton/nighthawk-omada-shim:v0.9.1
+    container_name: nighthawk-omada-shim
+    restart: unless-stopped
+    # Host networking lets ECSP discovery reach the Omada controller without
+    # binding UDP 29810 (the shim sends from an ephemeral UDP source port).
+    network_mode: host
+    environment:
+      OMADA_SOUTHBOUND: netgear
+      OMADA_CONTROLLER_HOST: 192.0.2.8
+      OMADA_CONTROLLER_ID: 0123456789abcdef0123456789abcdef
+      OMADA_SITE_ID: 0123456789abcdef01234567
+      OMADA_DEVICE_USERNAME: "${OMADA_DEVICE_USERNAME:-admin}"
+      OMADA_DEVICE_PASSWORD: "${OMADA_DEVICE_PASSWORD:?set OMADA_DEVICE_PASSWORD}"
+      # Use a unique locally administered virtual MAC per adopted shim instance.
+      OMADA_DEVICE_MAC: 02:00:00:00:00:01
+      OMADA_DEVICE_NAME: Nighthawk-AP-1
+      OMADA_DEVICE_MODEL: EAP770
+      OMADA_DEVICE_MODEL_VERSION: "2.0"
+      OMADA_DEVICE_HARDWARE_VERSION: "2.0"
+      OMADA_DEVICE_FIRMWARE_VERSION: "1.0.0"
+      OMADA_DEVICE_IP: 192.0.2.10
+      OMADA_LAN_RATE: "10000"
+      OMADA_LAN_DUPLEX: "1"
+      OMADA_NETGEAR_HOST: 192.0.2.10
+      OMADA_NETGEAR_USERNAME: "${OMADA_NETGEAR_USERNAME:-admin}"
+      OMADA_NETGEAR_PASSWORD: "${OMADA_NETGEAR_PASSWORD:?set OMADA_NETGEAR_PASSWORD}"
+      # Optional: set on multi-AP sites so each shim claims only its own stations.
+      # OMADA_NETGEAR_PHYSICAL_MAC: 02:00:00:00:a0:01
+      # Optional: enroll router HTTPS certificate DER SHA-256 for stock dashboard channel/link reads.
+      # OMADA_NETGEAR_DASHBOARD_CERT_SHA256: ""
+      # OMADA_NETGEAR_DASHBOARD_UPLINK: WAN
+      # Optional: read-only passive beacon and dedicated switch-port observation files.
+      # OMADA_NETGEAR_BEACON_FILE: /observations/receiver-1.json
+      # OMADA_NETGEAR_SECONDARY_BEACON_FILE: /observations/receiver-2.json
+      # OMADA_NETGEAR_UPLINK_FILE: /observations/ap1-uplink.json
+    volumes:
+      - ./state/ap1:/state
+      # - ./observations:/observations:ro

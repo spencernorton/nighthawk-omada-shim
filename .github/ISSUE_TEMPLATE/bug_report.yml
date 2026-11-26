@@ -1,0 +1,52 @@
+name: Bug report
+description: Something in Nighthawk Omada Shim does not behave as documented.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please remove anything private from logs and output before pasting them: passwords, real hardware MACs/BSSIDs, private SSIDs, and internal hostnames.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure the shim with ...
+        2. Adopt in Omada ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - "ECSP discovery / adoption"
+        - "Netgear SOAP adapter"
+        - "Stock dashboard reader"
+        - "Beacon / uplink observers"
+        - "Client attribution / multi-AP"
+        - "Docker / healthcheck"
+        - "Other / not sure"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: "Shim version, Omada Controller version, Netgear model and firmware version."
+      placeholder: "v0.9.1, Omada 6.3, RS700S stock firmware"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: "Relevant daemon or controller log output (scrubbed)."
+      render: text

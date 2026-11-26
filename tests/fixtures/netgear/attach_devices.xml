@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<soap-env:Envelope xmlns:soap-env="http://schemas.xmlsoap.org/soap/envelope/">
+<soap-env:Body>
+<m:GetAttachDeviceResponse xmlns:m="urn:NETGEAR-ROUTER:service:DeviceInfo:1">
+<NewAttachDevice>4@1;192.0.2.11;Phone;AA:BB:CC:DD:EE:01;wireless;1407;37;Allow@2;192.0.2.12;Plug;AA:BB:CC:DD:EE:02;wireless;63;82;Allow@3;192.0.2.13;;AA:BB:CC:DD:EE:03;wireless;2345;50;Allow@4;192.0.2.14;Server;AA:BB:CC:DD:EE:04;wired;;100;Allow</NewAttachDevice>
+<ResponseCode>000</ResponseCode>
+</m:GetAttachDeviceResponse>
+</soap-env:Body>
+</soap-env:Envelope>

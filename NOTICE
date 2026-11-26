@@ -1,0 +1,30 @@
+Nighthawk Omada Shim
+Copyright 2026 Spencer Norton
+
+This product includes software derived from Open Omada Device Agent
+(https://github.com/adryanalencar/open-omada-device-agent),
+originally licensed under the Apache License, Version 2.0:
+
+  Open Omada Device Agent
+  Copyright 2026 Open Omada contributors
+
+Baseline upstream commit: def9cadf44b60e3aea6afb4a9a3d2c99812288db.
+
+Substantive modifications in this derivative work include:
+- Netgear Nighthawk Genie SOAP southbound adapter (RS700/RS700S), bounded
+  client/state caching, and honest rejection of unsupported Omada SET intents;
+- Conservative tri-band EAP770/EAP773 negotiation profiles and Omada 6.3
+  inform wire-contract compatibility;
+- Optional certificate-pinned stock HTTPS dashboard telemetry reader;
+- Optional passive 802.11 BSS Load beacon observer and dedicated switch-port
+  uplink octet observer;
+- Per-device atomic session heartbeats, CLI --healthcheck probe, and OCI
+  container packaging.
+
+This is an independent, unofficial interoperability project.
+TP-Link, Omada, EAP, NETGEAR, Nighthawk, and related names and marks are the
+property of their respective owners. Their use here is solely descriptive and
+does not imply sponsorship, endorsement, or affiliation.
+
+No TP-Link or NETGEAR source code, firmware, certificates, private keys, or
+proprietary assets are distributed with this project.

@@ -1,0 +1,967 @@
+"""ECSP V2 adoption, managed reconnect, configuration ACKs and informs."""
+from __future__ import annotations
+
+import json
+import ssl
+import logging
+import socket
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+from .adapters.inbound.ecsp.mappers.configuration import parse_set_request
+from .adapters.inbound.ecsp.mappers.portal_auth import parse_portal_auth_request
+
+from .adapters.inbound.ecsp.crypto import calculate_md5_mode_auth
+from .application.commands import ApplyDeviceConfigurationCommand
+
+from .adapters.inbound.ecsp.protocol import (
+    CipherType,
+    MessageType,
+    build_message,
+    message_type_name,
+    recv_tcp_message,
+    send_tcp_message,
+)
+from .identity import controller_setting
+from .util.heartbeat import write_heartbeat
+from .contexts.device.domain import DeviceProfile
+from .contexts.lifecycle.domain import ManagedState
+from .contexts.lifecycle.application import ManagedSessionServices
+
+
+log = logging.getLogger("open_omada.adoption")
+CONFIG_OK = 0
+CONFIG_ERROR = 1
+
+
+class AuthenticationRejected(RuntimeError):
+    """Controller rejected the Device Account credentials for this attempt."""
+
+
+@dataclass
+class AdoptionResult:
+    reached_system_verify: bool = False
+    controller_id: str = ""
+    username: str = ""
+
+
+def _log_message(direction: str, message: dict[str, Any], *, dump_json: bool) -> None:
+    header = message.get("header") or {}
+    msg_type = int(header.get("type", -1))
+    log.info(
+        "%s %s type=%s seq=%s error=%s",
+        direction,
+        message_type_name(msg_type),
+        msg_type,
+        header.get("seq"),
+        header.get("error", 0),
+    )
+    if dump_json:
+        log.info(
+            "%s JSON %s",
+            direction,
+            json.dumps(message, ensure_ascii=False, separators=(",", ":")),
+        )
+
+
+def _recv_until(sock: socket.socket, expected: MessageType, *, dump_json: bool) -> dict[str, Any]:
+    while True:
+        message, _ = recv_tcp_message(sock)
+        _log_message("RX/TCP", message, dump_json=dump_json)
+        header = message.get("header") or {}
+        msg_type = int(header.get("type", -1))
+        if msg_type == int(expected):
+            return message
+        log.warning(
+            "Expected %s but controller sent %s first; keeping the session open.",
+            expected.name,
+            message_type_name(msg_type),
+        )
+
+
+def _preconnect_body(controller_id: str, *, profile: DeviceProfile, managed_reconnect: bool = False) -> dict[str, Any]:
+    # Controller 6.2's V2 PRE_CONNECT parser explicitly classifies rebuild=1
+    # as an already-managed reconnect. rebuild=0 + controllerSetting is the
+    # pre-link/adoption path; using that shape after a restart makes
+    # manager-core look for transient adopt state and the server closes the
+    # manage socket when none exists.
+    info = dict(profile.device_info())
+    if managed_reconnect:
+        info["isFactory"] = False
+
+    return {
+        "needUsername": True,
+        "rebuild": 1 if managed_reconnect else 0,
+        "secureCap": 0,
+        "deviceInfo": info,
+        "deviceMisc": profile.device_misc(),
+        # rebuild=1 wins the mode classification. Keeping controllerSetting on
+        # reconnect also lets manager-core reconstruct controller routing if a
+        # MAC -> Omadac mapping is temporarily absent.
+        "controllerSetting": controller_setting(controller_id),
+    }
+
+
+def _device_negotiation_body(
+    controller_id: str, *, profile: DeviceProfile, config_version: int = 0
+) -> dict[str, Any]:
+    """Build the minimal AP V2 adoption response accepted by manager-core.
+
+    ``devCap`` and ``components_v2`` must be objects, not null.  More
+    importantly, ``components_v2`` must contain at least one controller-known
+    component: an empty map is accepted on the wire but manager-core later
+    marks the rebuilt component image invalid/incompatible.
+
+    ``configVersion`` must also be present or the adoption handler stops before
+    SYSTEM_NEGOTIATION. Initial adoption reports 0 to request a full sync, while
+    managed reconnects report the last persisted version so Controller does not
+    unnecessarily provision the same full configuration again.
+    """
+    adopt_info = dict(profile.device_info())
+    # These are discovery-only fields.  ApAdoptDeviceInfoV2 stores unknown
+    # members, but omitting them makes the negotiation payload match its DTO.
+    adopt_info.pop("ip", None)
+    adopt_info.pop("isFactory", None)
+
+    return {
+        "configVersion": int(config_version),
+        "devCap": {},
+        "deviceInfo": adopt_info,
+        "controllerSetting": {"controllerId": controller_id},
+        "components": {},
+        "components_v2": dict(profile.components_v2()),
+        "channelInfo": list(profile.channel_info()),
+        "radioCap": list(profile.radio_cap()),
+        "deviceMisc": profile.device_misc(),
+    }
+
+
+def _project_inform_body(*, services: ManagedSessionServices, need_reply: bool, started_at: float) -> dict[str, Any]:
+    """Production inform path: lifecycle supplies time, projection owns shape."""
+    return services.inform.build(
+        need_reply=need_reply,
+        uptime=max(0, int(time.monotonic() - started_at)),
+    )
+
+
+def _set_response_body(
+    request: dict[str, Any],
+    *,
+    current_config_version: int | None = None,
+    errcode: int = CONFIG_OK,
+) -> dict[str, Any]:
+    """Build the ECSP V2 BaseConfigResponse for a SET_REQUEST.
+
+    Controller uses two valid versioning forms in ``BaseConfigBody``:
+
+    * ``configVersion`` for a full/absolute configuration;
+    * ``configVersionInc`` for an incremental setting change.
+
+    The latter is what Controller 6.2 sends for small live changes such as the
+    AP locate LED.  The request does not contain the resulting absolute version,
+    so the device derives it from the version it has already applied.
+    """
+    body = request.get("body") or {}
+    if not isinstance(body, dict):
+        raise RuntimeError("SET_REQUEST body is not an object")
+
+    sequence_id = body.get("sequenceId")
+    if sequence_id is None:
+        raise RuntimeError(
+            "SET_REQUEST is missing sequenceId; refusing to ACK an uncorrelated config"
+        )
+
+    absolute_version = body.get("configVersion")
+    version_inc = body.get("configVersionInc")
+
+    if absolute_version is not None:
+        applied_version = int(absolute_version)
+    elif version_inc is not None:
+        if current_config_version is None:
+            raise RuntimeError(
+                "SET_REQUEST uses configVersionInc but the local config version is unknown"
+            )
+        increment = int(version_inc)
+        if increment < 0:
+            raise RuntimeError(
+                f"SET_REQUEST has invalid negative configVersionInc={increment}"
+            )
+        applied_version = int(current_config_version) + increment
+    else:
+        raise RuntimeError(
+            "SET_REQUEST has neither configVersion nor configVersionInc"
+        )
+
+    response_version = (
+        int(current_config_version)
+        if errcode != CONFIG_OK and current_config_version is not None
+        else applied_version
+    )
+
+    return {
+        "sequenceId": int(sequence_id),
+        "errcode": int(errcode),
+        "configVersion": response_version,
+    }
+
+
+def _get_response_body(request: dict[str, Any], *, errcode: int = CONFIG_ERROR) -> dict[str, Any]:
+    body = request.get("body") or {}
+    if not isinstance(body, dict):
+        raise RuntimeError("GET_REQUEST body is not an object")
+    sequence_id = body.get("sequenceId")
+    if sequence_id is None:
+        raise RuntimeError("GET_REQUEST is missing sequenceId")
+    request_keys = tuple(sorted(key for key in body if key != "sequenceId"))
+    response: dict[str, Any] = {
+        "sequenceId": int(sequence_id),
+        "errcode": int(errcode),
+    }
+    if request_keys:
+        response["unsupportedKeys"] = list(request_keys)
+    return response
+
+
+def _notify_reply_body(
+    request: dict[str, Any],
+    *,
+    errcode: int = CONFIG_ERROR,
+    result: object | None = None,
+) -> dict[str, Any]:
+    body = request.get("body") or {}
+    if not isinstance(body, dict):
+        raise RuntimeError("NOTIFY_REQUEST body is not an object")
+    reply: dict[str, Any] = {"err": int(errcode)}
+    if body.get("nid") is not None:
+        reply["nid"] = int(body["nid"])
+    if body.get("sub") is not None:
+        reply["sub"] = int(body["sub"])
+    if result is not None:
+        reply["rst"] = result
+    elif errcode != CONFIG_OK:
+        reply["rst"] = {"error": "unsupported notify request"}
+    return reply
+
+
+def _describe_config_update(update: ApplyDeviceConfigurationCommand) -> str:
+    parts = [
+        f"sequenceId={update.sequence_id}",
+        f"configVersion={update.config_version}",
+        f"configVersionInc={update.config_version_inc}",
+    ]
+    if update.radios:
+        bands = ",".join(sorted(radio.band.value for radio in update.radios))
+        parts.append(f"radios={len(update.radios)}[{bands}]")
+    if update.wlans:
+        bands = ",".join(sorted(wlan.band.value for wlan in update.wlans))
+        parts.append(f"wlans={len(update.wlans)}[{bands}]")
+    if update.management_vlan is not None:
+        parts.append(
+            "managementVlan="
+            f"{'on' if update.management_vlan.enabled else 'off'}:"
+            f"{update.management_vlan.vlan_id}"
+        )
+    if update.led is not None:
+        parts.append(
+            "led="
+            f"enable:{update.led.enabled if update.led.enabled is not None else 'unset'},"
+            f"locate:{update.led.locate if update.led.locate is not None else 'unset'}"
+        )
+    if update.wifi_control_led is not None:
+        parts.append("wifiControlLed=present")
+    if update.portal_free_policy is not None:
+        parts.append(
+            "portalFreePolicy="
+            f"l2:{len(update.portal_free_policy.layer2_rules)},"
+            f"url:{len(update.portal_free_policy.url_rules)}"
+        )
+    if update.portal_configs:
+        parts.append(f"portalConfigList={len(update.portal_configs)}")
+    if update.client_configs:
+        parts.append(f"clientConfig={len(update.client_configs)}")
+    if update.client_operations:
+        ops = ",".join(
+            "unknown" if operation.operation is None else str(operation.operation)
+            for operation in update.client_operations
+        )
+        parts.append(f"clientOperation={len(update.client_operations)}[{ops}]")
+    if update.client_rate_config is not None:
+        parts.append(
+            "clientRateConfig="
+            f"action:{update.client_rate_config.action},"
+            f"limits:{len(update.client_rate_config.limits)}"
+        )
+    if update.passive_keys:
+        parts.append(f"passive={','.join(update.passive_keys)}")
+    if update.ack_only_keys:
+        parts.append(f"ackOnly={','.join(update.ack_only_keys)}")
+    if update.unhandled_keys:
+        parts.append(f"unhandled={','.join(update.unhandled_keys)}")
+    return " ".join(parts)
+
+
+def _apply_config_update(update: ApplyDeviceConfigurationCommand, *, services: ManagedSessionServices) -> int:
+    result = services.configuration.execute(update)
+    if not result.applied:
+        log.error("AP configuration reconciliation failed: %s", result.error)
+        return CONFIG_ERROR
+    log.info("AP configuration reconciliation completed: changed=%s", result.changed)
+    return CONFIG_OK
+
+
+def _send_set_response(
+    sock: socket.socket,
+    request: dict[str, Any],
+    *,
+    controller_id: str,
+    current_config_version: int | None,
+    dump_json: bool,
+    services: ManagedSessionServices,
+) -> tuple[int, int, int]:
+    """Acknowledge a controller SET_REQUEST and return version/sequence."""
+    request_header = request.get("header") or {}
+    errcode = CONFIG_OK
+    try:
+        update = parse_set_request(request)
+        log.info("Parsed AP SET_REQUEST domains: %s", _describe_config_update(update))
+        errcode = _apply_config_update(update, services=services)
+    except ValueError as exc:
+        errcode = CONFIG_ERROR
+        log.warning("Could not parse AP config domains in SET_REQUEST: %s", exc)
+    response_body = _set_response_body(
+        request, current_config_version=current_config_version, errcode=errcode
+    )
+    response = build_message(
+        mac=services.settings.mac,
+        msg_type=MessageType.SET_RESPONSE,
+        body=response_body,
+        version=services.settings.ecsp_version,
+        ver_cap=services.settings.ecsp_ver_cap,
+        # Request/response correlation uses the ECSP header seq, exactly as
+        # INFORM_RESPONSE mirrors INFORM_REQUEST.seq.
+        seq=request_header.get("seq"),
+        dest=controller_id,
+        timestamp=int(time.time() * 1000),
+        error=0,
+    )
+    send_tcp_message(sock, response)
+    _log_message("TX/TCP", response, dump_json=dump_json)
+    return (
+        int(response_body["configVersion"]),
+        int(response_body["sequenceId"]),
+        int(response_body["errcode"]),
+    )
+
+
+def _send_inform(
+    sock: socket.socket,
+    *,
+    seq: int,
+    controller_id: str,
+    started_at: float,
+    need_reply: bool,
+    dump_json: bool,
+    services: ManagedSessionServices,
+) -> None:
+    inform = build_message(
+        mac=services.settings.mac,
+        msg_type=MessageType.INFORM_REQUEST,
+        body=_project_inform_body(services=services, need_reply=need_reply, started_at=started_at),
+        version=services.settings.ecsp_version,
+        ver_cap=services.settings.ecsp_ver_cap,
+        seq=seq,
+        dest=controller_id,
+        timestamp=int(time.time() * 1000),
+    )
+    send_tcp_message(sock, inform)
+    _log_message("TX/TCP", inform, dump_json=dump_json)
+    write_heartbeat(
+        getattr(services.settings, "heartbeat_file", None),
+        phase="managed",
+        mac=services.settings.mac,
+        controller_host=getattr(services.settings, "controller_host", ""),
+        seq=seq,
+    )
+
+
+def _send_get_response(
+    sock: socket.socket,
+    request: dict[str, Any],
+    *,
+    controller_id: str,
+    dump_json: bool,
+    services: ManagedSessionServices,
+) -> tuple[int, int]:
+    request_header = request.get("header") or {}
+    response_body = _get_response_body(request, errcode=CONFIG_ERROR)
+    response = build_message(
+        mac=services.settings.mac,
+        msg_type=MessageType.GET_RESPONSE,
+        body=response_body,
+        version=services.settings.ecsp_version,
+        ver_cap=services.settings.ecsp_ver_cap,
+        seq=request_header.get("seq"),
+        dest=controller_id,
+        timestamp=int(time.time() * 1000),
+        error=0,
+    )
+    send_tcp_message(sock, response)
+    _log_message("TX/TCP", response, dump_json=dump_json)
+    return int(response_body["sequenceId"]), int(response_body["errcode"])
+
+
+def _handle_managed_get_request(
+    sock: socket.socket,
+    request: dict[str, Any],
+    *,
+    controller_id: str,
+    dump_json: bool,
+    services: ManagedSessionServices,
+) -> tuple[int, int]:
+    """Handle one managed GET through the injected session dependencies."""
+    return _send_get_response(
+        sock,
+        request,
+        controller_id=controller_id,
+        dump_json=dump_json,
+        services=services,
+    )
+
+
+def _send_notify_reply(
+    sock: socket.socket,
+    request: dict[str, Any],
+    *,
+    controller_id: str,
+    dump_json: bool,
+    services: ManagedSessionServices,
+) -> bool:
+    request_header = request.get("header") or {}
+    body = request.get("body") or {}
+    if isinstance(body, dict) and int(body.get("nre") or 0) == 1:
+        log.info(
+            "Controller NOTIFY_REQUEST has nre=1; no reply will be sent for subject=%r notifyId=%r",
+            body.get("sub"),
+            body.get("nid"),
+        )
+        return False
+    request_type = int(request_header.get("type", -1))
+    response_type = (
+        MessageType.NOTIFY_REPLY_V2
+        if request_type == int(MessageType.NOTIFY_REQUEST_V2)
+        else MessageType.NOTIFY_REPLY
+    )
+    response = build_message(
+        mac=services.settings.mac,
+        msg_type=response_type,
+        body=_notify_reply_body(request, errcode=CONFIG_ERROR),
+        version=services.settings.ecsp_version,
+        ver_cap=services.settings.ecsp_ver_cap,
+        seq=request_header.get("seq"),
+        dest=controller_id,
+        timestamp=int(time.time() * 1000),
+        error=0,
+    )
+    send_tcp_message(sock, response)
+    _log_message("TX/TCP", response, dump_json=dump_json)
+    return True
+
+
+def _portal_auth_response_body(*, errcode: int = CONFIG_OK) -> dict[str, Any]:
+    return {"err": int(errcode)}
+
+
+def _handle_portal_auth_request(
+    sock: socket.socket,
+    request: dict[str, Any],
+    *,
+    controller_id: str,
+    dump_json: bool,
+    services: ManagedSessionServices,
+) -> tuple[int | None, int]:
+    request_header = request.get("header") or {}
+    request_seq = request_header.get("seq")
+    errcode = CONFIG_OK
+    try:
+        update = parse_portal_auth_request(request)
+        log.info("Parsed AP EVENT_PORTAL_AUTH domains: %s", _describe_config_update(update))
+        errcode = _apply_config_update(update, services=services)
+    except ValueError as exc:
+        errcode = CONFIG_ERROR
+        log.warning("Could not parse AP EVENT_PORTAL_AUTH body: %s", exc)
+
+    if request_seq is None:
+        log.info(
+            "Controller EVENT_PORTAL_AUTH has no ECSP seq; applied locally without response errcode=%d",
+            errcode,
+        )
+        return None, errcode
+
+    response = build_message(
+        mac=services.settings.mac,
+        msg_type=MessageType.EVENT_PORTAL_AUTH_RESPONSE,
+        body=_portal_auth_response_body(errcode=errcode),
+        version=services.settings.ecsp_version,
+        ver_cap=services.settings.ecsp_ver_cap,
+        seq=request_seq,
+        dest=controller_id,
+        timestamp=int(time.time() * 1000),
+        error=0,
+    )
+    send_tcp_message(sock, response)
+    _log_message("TX/TCP", response, dump_json=dump_json)
+    return int(request_seq), errcode
+
+
+def _send_forget_response(
+    sock: socket.socket,
+    request: dict[str, Any],
+    *,
+    controller_id: str,
+    dump_json: bool,
+    services: ManagedSessionServices,
+) -> MessageType:
+    request_type = int((request.get("header") or {}).get("type", -1))
+    if request_type == int(MessageType.FORGET_REQUEST_NO_RESET):
+        response_type = MessageType.FORGET_RESPONSE_NO_RESET
+    elif request_type == int(MessageType.FORGET_REQUEST):
+        response_type = MessageType.FORGET_RESPONSE
+    else:
+        raise RuntimeError(f"cannot build forget response for message type {request_type}")
+
+    response = build_message(
+        mac=services.settings.mac,
+        msg_type=response_type,
+        body={},
+        version=services.settings.ecsp_version,
+        ver_cap=services.settings.ecsp_ver_cap,
+        seq=None,
+        dest=controller_id,
+        timestamp=int(time.time() * 1000),
+        error=0,
+    )
+    send_tcp_message(sock, response)
+    _log_message("TX/TCP", response, dump_json=dump_json)
+    return response_type
+
+
+def run_v2_adoption(
+    *,
+    controller_host: str,
+    adopt_port: int,
+    controller_id: str,
+    dump_json: bool = False,
+    managed_reconnect: bool = False,
+    known_config_version: int | None = None,
+    services: ManagedSessionServices,
+) -> AdoptionResult:
+    if not controller_id:
+        raise RuntimeError(
+            "PRE_ADOPT_REQUEST did not provide header.dest and OMADA_CONTROLLER_ID is empty"
+        )
+
+    write_heartbeat(
+        getattr(services.settings, "heartbeat_file", None),
+        phase="connecting",
+        mac=services.settings.mac,
+        controller_host=controller_host,
+    )
+    log.info(
+        "Opening V2 %s TCP session to %s:%d",
+        "managed-reconnect" if managed_reconnect else "manage/adopt",
+        controller_host,
+        adopt_port,
+    )
+    raw_sock = socket.create_connection(
+        (controller_host, adopt_port),
+        timeout=services.settings.tcp_timeout,
+    )
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+
+    if services.settings.tls_verify:
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        if services.settings.tls_ca_file:
+            ctx.load_verify_locations(cafile=services.settings.tls_ca_file)
+        else:
+            ctx.load_default_certs()
+    else:
+        # Omada device-management endpoints commonly use private/self-signed
+        # certificates. Verification is therefore operator-controlled.
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    sock = ctx.wrap_socket(
+        raw_sock,
+        server_hostname=controller_host,
+    )
+    sock.settimeout(services.settings.tcp_timeout)
+
+    seq = 1
+    started_at = time.monotonic()
+    managed_ready = False
+    try:
+        preconnect = build_message(
+            mac=services.settings.mac,
+            msg_type=MessageType.PRE_CONNECT_INFO,
+            body=_preconnect_body(controller_id, profile=services.device_profile, managed_reconnect=managed_reconnect),
+            version=services.settings.ecsp_version,
+            ver_cap=services.settings.ecsp_ver_cap,
+            seq=seq,
+            dest=controller_id,
+            timestamp=int(time.time() * 1000),
+        )
+        send_tcp_message(sock, preconnect)
+        _log_message("TX/TCP", preconnect, dump_json=dump_json)
+
+        response = _recv_until(sock, MessageType.PRE_CONNECT_INFO_RESPONSE, dump_json=dump_json)
+        response_header = response.get("header") or {}
+        if int(response_header.get("error", 0)) != 0:
+            raise RuntimeError(
+                f"controller rejected PRE_CONNECT_INFO: error={response_header.get('error')}"
+            )
+        body = response.get("body") or {}
+        random_device_key = body.get("randomKeyForDeviceVerify")
+        if not isinstance(random_device_key, str) or len(random_device_key) < 36:
+            raise RuntimeError(
+                "PRE_CONNECT_INFO_RESPONSE has no usable randomKeyForDeviceVerify"
+            )
+
+        username = services.settings.device_username or body.get("username") or ""
+        if not username:
+            raise RuntimeError(
+                "controller did not return a username; set OMADA_DEVICE_USERNAME to the site's Device Account username"
+            )
+        if not services.settings.device_password:
+            raise RuntimeError(
+                "PRE_CONNECT succeeded, but OMADA_DEVICE_PASSWORD is empty. "
+                "Set it locally to the site's Device Account password and retry adoption."
+            )
+        if services.settings.device_cipher_type != int(CipherType.MD5):
+            raise RuntimeError(
+                "this implementation currently supports only the verified legacy MD5 branch (OMADA_DEVICE_CIPHER_TYPE=5)"
+            )
+
+        random_system_key = str(uuid.uuid4())
+        device_auth = calculate_md5_mode_auth(username, services.settings.device_password, random_device_key)
+        seq += 1
+        verify = build_message(
+            mac=services.settings.mac,
+            msg_type=MessageType.DEVICE_VERIFY_INFO,
+            body={
+                "auth": device_auth,
+                "randomKeyForSystemVerify": random_system_key,
+                "cipherType": int(CipherType.MD5),
+            },
+            version=services.settings.ecsp_version,
+            ver_cap=services.settings.ecsp_ver_cap,
+            seq=seq,
+            dest=controller_id,
+            timestamp=int(time.time() * 1000),
+        )
+        send_tcp_message(sock, verify)
+        _log_message("TX/TCP", verify, dump_json=dump_json)
+
+        verify_response = _recv_until(sock, MessageType.DEVICE_VERIFY_RESPONSE, dump_json=dump_json)
+        verify_header = verify_response.get("header") or {}
+        verify_error = int(verify_header.get("error", 0))
+        if verify_error != 0:
+            raise AuthenticationRejected(
+                f"controller rejected DEVICE_VERIFY_INFO: error={verify_error}. "
+                "The Device Account username/password most likely do not match."
+            )
+
+        verify_body = verify_response.get("body") or {}
+        controller_auth = verify_body.get("auth")
+        expected_controller_auth = calculate_md5_mode_auth(
+            username, services.settings.device_password, random_system_key
+        )
+        if not isinstance(controller_auth, str):
+            raise RuntimeError("DEVICE_VERIFY_RESPONSE succeeded but contains no legacy auth")
+        if controller_auth.upper() != expected_controller_auth.upper():
+            raise RuntimeError(
+                "controller system-auth did not verify; refusing to mark SYSTEM_VERIFY_RESULT success"
+            )
+        log.info("Mutual legacy ECSP authentication verified for username=%r", username)
+
+        seq += 1
+        system_result = build_message(
+            mac=services.settings.mac,
+            msg_type=MessageType.SYSTEM_VERIFY_RESULT,
+            body={},
+            version=services.settings.ecsp_version,
+            ver_cap=services.settings.ecsp_ver_cap,
+            seq=seq,
+            dest=controller_id,
+            timestamp=int(time.time() * 1000),
+            error=0,
+        )
+        send_tcp_message(sock, system_result)
+        _log_message("TX/TCP", system_result, dump_json=dump_json)
+
+        verify_ack = _recv_until(sock, MessageType.VERIFY_RESULT_ACK, dump_json=dump_json)
+        verify_ack_error = int((verify_ack.get("header") or {}).get("error", 0))
+        if verify_ack_error != 0:
+            raise RuntimeError(
+                f"controller rejected SYSTEM_VERIFY_RESULT: error={verify_ack_error}"
+            )
+        log.info("VERIFY_RESULT_ACK accepted; starting AP capability negotiation")
+
+        seq += 1
+        negotiation_config_version = (
+            int(known_config_version)
+            if managed_reconnect and known_config_version is not None
+            else 0
+        )
+        negotiation_body = _device_negotiation_body(
+            controller_id, profile=services.device_profile, config_version=negotiation_config_version
+        )
+        log.info(
+            "Advertising %d ECSP V2 AP components at configVersion=%d: %s",
+            len(negotiation_body["components_v2"]),
+            negotiation_config_version,
+            ",".join(sorted(negotiation_body["components_v2"])),
+        )
+        negotiation = build_message(
+            mac=services.settings.mac,
+            msg_type=MessageType.DEVICE_NEGOTIATION,
+            body=negotiation_body,
+            version=services.settings.ecsp_version,
+            ver_cap=services.settings.ecsp_ver_cap,
+            seq=seq,
+            dest=controller_id,
+            timestamp=int(time.time() * 1000),
+        )
+        send_tcp_message(sock, negotiation)
+        _log_message("TX/TCP", negotiation, dump_json=dump_json)
+
+        system_negotiation = _recv_until(
+            sock, MessageType.SYSTEM_NEGOTIATION, dump_json=dump_json
+        )
+        system_header = system_negotiation.get("header") or {}
+        system_error = int(system_header.get("error", 0))
+        if system_error != 0:
+            raise RuntimeError(
+                f"controller rejected DEVICE_NEGOTIATION: error={system_error}"
+            )
+
+        system_body = system_negotiation.get("body")
+        if isinstance(system_body, dict):
+            log.info(
+                "SYSTEM_NEGOTIATION accepted: configVersion=%r sequenceId=%r keys=%s",
+                system_body.get("configVersion"),
+                system_body.get("sequenceId"),
+                ",".join(sorted(system_body.keys())),
+            )
+        else:
+            log.warning("SYSTEM_NEGOTIATION has no object body: %r", system_body)
+
+        seq += 1
+        init_sync_result = build_message(
+            mac=services.settings.mac,
+            msg_type=MessageType.INIT_SYNC_RESULT,
+            version=services.settings.ecsp_version,
+            ver_cap=services.settings.ecsp_ver_cap,
+            seq=seq,
+            dest=controller_id,
+            timestamp=int(time.time() * 1000),
+            error=0,
+            include_body=False,
+        )
+        send_tcp_message(sock, init_sync_result)
+        _log_message("TX/TCP", init_sync_result, dump_json=dump_json)
+
+        init_ack = _recv_until(sock, MessageType.INIT_SYNC_RESULT_ACK, dump_json=dump_json)
+        init_ack_error = int((init_ack.get("header") or {}).get("error", 0))
+        if init_ack_error != 0:
+            raise RuntimeError(
+                f"controller rejected INIT_SYNC_RESULT: error={init_ack_error}"
+            )
+
+        managed_ready = True
+        log.warning(
+            "INIT_SYNC_RESULT_ACK received. ECSP V2 adoption/initial-sync handshake is complete; "
+            "starting managed AP informs and logging post-adoption traffic."
+        )
+
+        config_version = known_config_version if managed_reconnect else None
+        sequence_id = None
+        if isinstance(system_body, dict):
+            if system_body.get("configVersion") is not None:
+                config_version = int(system_body["configVersion"])
+            if system_body.get("sequenceId") is not None:
+                sequence_id = int(system_body["sequenceId"])
+        saved = services.state_repository.save(ManagedState(
+            version=1,
+            mac=services.settings.mac,
+            controller_host=controller_host,
+            controller_id=controller_id,
+            manage_port=adopt_port,
+            site_id=services.settings.site_id,
+            username=username,
+            config_version=config_version,
+            sequence_id=sequence_id,
+            updated_at=int(time.time()),
+            model=services.settings.model,
+        ))
+        log.info(
+            "Managed reconnect state saved to %s (controller=%s:%d, mac=%s); no password is persisted",
+            services.settings.state_file,
+            saved.controller_host,
+            saved.manage_port,
+            saved.mac,
+        )
+
+        # A real EAP begins sending informs after initial sync.  The first one
+        # requests an INFORM_RESPONSE so this lab agent gets explicit evidence
+        # that manager-core parsed the body.  Subsequent informs are fire-and-
+        # forget and keep the server's CONNECTED context fresh.
+        seq += 1
+        _send_inform(
+            sock,
+            seq=seq,
+            controller_id=controller_id,
+            started_at=started_at,
+            need_reply=True,
+            dump_json=dump_json,
+            services=services,
+        )
+        next_inform_at = time.monotonic() + max(0.5, services.settings.inform_interval)
+
+        # The next phase is the managed-device protocol (SET/GET/INFORM/NOTIFY).
+        # SET_RESPONSE is grounded in the controller's BaseConfigResponse
+        # schema. GET/NOTIFY handlers preserve request correlation and return
+        # explicit unsupported responses until payload-specific bodies are known.
+        sock.settimeout(0.5)
+        while True:
+            now = time.monotonic()
+            if now >= next_inform_at:
+                seq += 1
+                _send_inform(
+                    sock,
+                    seq=seq,
+                    controller_id=controller_id,
+                    started_at=started_at,
+                    need_reply=False,
+                    dump_json=dump_json,
+                    services=services,
+                )
+                next_inform_at = now + max(0.5, services.settings.inform_interval)
+
+            try:
+                message, _ = recv_tcp_message(sock)
+            except socket.timeout:
+                continue
+            _log_message("RX/TCP", message, dump_json=dump_json)
+
+            header = message.get("header") or {}
+            msg_type = int(header.get("type", -1))
+            if msg_type == int(MessageType.SET_REQUEST):
+                applied_config_version, applied_sequence_id, set_errcode = _send_set_response(
+                    sock,
+                    message,
+                    controller_id=controller_id,
+                    current_config_version=config_version,
+                    dump_json=dump_json,
+                    services=services,
+                )
+                if set_errcode != CONFIG_OK:
+                    log.error(
+                        "Controller SET_REQUEST failed locally: errcode=%d sequenceId=%d",
+                        set_errcode,
+                        applied_sequence_id,
+                    )
+                    continue
+                config_version = applied_config_version
+                sequence_id = applied_sequence_id
+                services.state_repository.save(ManagedState(
+                    version=1,
+                    mac=services.settings.mac,
+                    controller_host=controller_host,
+                    controller_id=controller_id,
+                    manage_port=adopt_port,
+                    site_id=services.settings.site_id,
+                    username=username,
+                    config_version=applied_config_version,
+                    sequence_id=applied_sequence_id,
+                    updated_at=int(time.time()),
+                    model=services.settings.model,
+                ))
+                log.info(
+                    "Applied controller config envelope: configVersion=%d sequenceId=%d; managed state updated",
+                    applied_config_version,
+                    applied_sequence_id,
+                )
+            elif msg_type == int(MessageType.GET_REQUEST):
+                get_sequence_id, get_errcode = _handle_managed_get_request(
+                    sock,
+                    message,
+                    controller_id=controller_id,
+                    dump_json=dump_json,
+                    services=services,
+                )
+                log.error(
+                    "Controller GET_REQUEST key is unsupported locally: errcode=%d sequenceId=%d",
+                    get_errcode,
+                    get_sequence_id,
+                )
+            elif msg_type in {
+                int(MessageType.NOTIFY_REQUEST),
+                int(MessageType.NOTIFY_REQUEST_V2),
+            }:
+                replied = _send_notify_reply(
+                    sock,
+                    message,
+                    controller_id=controller_id,
+                    dump_json=dump_json,
+                    services=services,
+                )
+                if replied:
+                    log.error("Controller NOTIFY_REQUEST subject is unsupported locally")
+            elif msg_type == int(MessageType.EVENT_PORTAL_AUTH):
+                portal_sequence_id, portal_errcode = _handle_portal_auth_request(
+                    sock,
+                    message,
+                    controller_id=controller_id,
+                    dump_json=dump_json,
+                    services=services,
+                )
+                if portal_errcode != CONFIG_OK:
+                    log.error(
+                        "Controller EVENT_PORTAL_AUTH failed locally: errcode=%d seq=%s",
+                        portal_errcode,
+                        portal_sequence_id,
+                    )
+            elif msg_type in {
+                int(MessageType.FORGET_REQUEST),
+                int(MessageType.FORGET_REQUEST_NO_RESET),
+            }:
+                response_type = _send_forget_response(
+                    sock,
+                    message,
+                    controller_id=controller_id,
+                    dump_json=dump_json,
+                    services=services,
+                )
+                cleared = services.state_repository.clear()
+                log.warning(
+                    "Controller sent %s; replied with %s, cleared managed state=%s and ending session",
+                    message_type_name(msg_type),
+                    response_type.name,
+                    cleared,
+                )
+                return AdoptionResult(managed_ready, controller_id, username)
+
+    except (EOFError, ConnectionError, OSError) as exc:
+        log.warning("ECSP TCP session ended: %s", exc)
+        return AdoptionResult(managed_ready, controller_id, locals().get("username", ""))
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass

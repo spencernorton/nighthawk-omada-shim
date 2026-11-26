@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify tag and test suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+      - name: Verify stable tag matches main, pyproject.toml, and CHANGELOG.md
+        run: |
+          printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          git merge-base --is-ancestor HEAD origin/main
+          version="${RELEASE_TAG#v}"
+          python -c "import tomllib, pathlib, sys; v = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version']; sys.exit(0 if v == sys.argv[1] else 1)" "$version"
+          grep -q "^## $version " CHANGELOG.md
+      - name: Install and run test suite
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m compileall -q src tests agent.py
+          pytest -q
+          ruff check .
+
+  publish-amd64:
+    name: Publish (amd64)
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      REGISTRY_TOKEN: ${{ github.token }}
+      ARCH: amd64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Build and push amd64 image
+        run: sh tools/release_image.sh arch
+
+  publish-arm64:
+    name: Publish (arm64)
+    needs: [verify]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      REGISTRY_TOKEN: ${{ github.token }}
+      ARCH: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Build and push arm64 image
+        run: sh tools/release_image.sh arch
+
+  release:
+    name: Release
+    needs: [publish-amd64, publish-arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      REGISTRY_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Create multi-arch manifest and digest
+        run: sh tools/release_image.sh join
+      - name: Publish GitHub Release
+        run: |
+          version="${RELEASE_TAG#v}"
+          awk -v h="## $version " 'index($0, h) == 1 {on = 1; next} on && /^## / {exit} on' CHANGELOG.md > notes.md
+          test -s notes.md
+          mkdir -p release-assets
+          cp IMAGE_DIGEST.txt release-assets/
+          git archive --format=tar.gz --prefix="nighthawk-omada-shim-$version/" HEAD > "release-assets/nighthawk-omada-shim-$version.tar.gz"
+          (cd release-assets && sha256sum * > SHA256SUMS.txt)
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --verify-tag --title "Nighthawk Omada Shim $version" --notes-file notes.md
